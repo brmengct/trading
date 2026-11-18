@@ -1,167 +1,201 @@
 import React, { useState, useEffect, useCallback } from 'react';
 
 const DRIVER_STYLES = {
-  VOLUME_SURGE: {
-    border: 'border-amber-500 bg-amber-950/20',
-    badge: 'bg-amber-500/20 text-amber-300 border-amber-500/40',
-    accent: 'text-amber-400',
-  },
-  OVERBOUGHT: {
-    border: 'border-rose-500 bg-rose-950/20',
-    badge: 'bg-rose-500/20 text-rose-300 border-rose-500/40',
-    accent: 'text-rose-400',
-  },
-  OVERSOLD: {
-    border: 'border-emerald-500 bg-emerald-950/20',
-    badge: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40',
-    accent: 'text-emerald-400',
-  },
-  NEWS_CATALYST: {
-    border: 'border-sky-500 bg-sky-950/20',
-    badge: 'bg-sky-500/20 text-sky-300 border-sky-500/40',
-    accent: 'text-sky-400',
-  },
-  BALANCED: {
-    border: 'border-slate-700 bg-slate-900/60',
-    badge: 'bg-slate-800 text-slate-300 border-slate-700',
-    accent: 'text-slate-300',
-  },
+  VOLUME_SURGE: 'amber',
+  OVERBOUGHT: 'rose',
+  OVERSOLD: 'green',
+  RELATIVE_OVERSOLD: 'violet',
+  SECTOR_WEAKNESS: 'blue',
+  NEWS_CATALYST: 'cyan',
+  BALANCED: 'slate',
 };
 
-export default function App() {
+const FILTERS = [
+  ['ALL', 'All signals'],
+  ['PINNED', 'Watchlist'],
+  ['VOLUME_SURGE', 'Volume'],
+  ['OVERSOLD', 'Oversold'],
+  ['OVERBOUGHT', 'Overbought'],
+  ['NEWS_CATALYST', 'News'],
+];
+
+const formatNumber = (value, digits = 1) =>
+  value != null && Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : '—';
+
+const formatPercent = (value) =>
+  value == null ? '—' : `${Number(value) > 0 ? '+' : ''}${formatNumber(value, 2)}%`;
+
+function App() {
   const [stocks, setStocks] = useState([]);
   const [filter, setFilter] = useState('ALL');
   const [loading, setLoading] = useState(true);
   const [tickerInput, setTickerInput] = useState('');
+  const [error, setError] = useState('');
   const [customTickers, setCustomTickers] = useState(() => {
     try {
-      const saved = localStorage.getItem('custom_scanner_tickers');
-      return saved ? JSON.parse(saved) : [];
+      const saved = JSON.parse(localStorage.getItem('custom_scanner_tickers') || '[]');
+      return Array.isArray(saved) ? saved : [];
     } catch {
       return [];
     }
   });
   const [cacheInfo, setCacheInfo] = useState({ cached: false, age: 0 });
 
-  // Persist custom tickers to localStorage
   useEffect(() => {
     localStorage.setItem('custom_scanner_tickers', JSON.stringify(customTickers));
   }, [customTickers]);
+
+  const requestMarketData = useCallback(
+    async (forceRefresh = false) => {
+      const params = new URLSearchParams();
+      if (customTickers.length) params.set('custom', customTickers.join(','));
+      if (forceRefresh) params.set('force_refresh', 'true');
+
+      const response = await fetch(
+        `http://localhost:8000/api/interesting-stocks?${params.toString()}`
+      );
+      if (!response.ok) throw new Error(`Market data request failed (${response.status})`);
+      return response.json();
+    },
+    [customTickers]
+  );
+
+  const applyMarketData = useCallback((data) => {
+    setStocks(data.stocks || []);
+    setError('');
+    setCacheInfo({
+      cached: Boolean(data.cached),
+      age: data.cache_age_sec || 0,
+    });
+  }, []);
 
   const fetchMarketData = useCallback(
     async (forceRefresh = false) => {
       setLoading(true);
       try {
-        const params = new URLSearchParams();
-        if (customTickers.length > 0) {
-          params.set('custom', customTickers.join(','));
-        }
-        if (forceRefresh) {
-          params.set('force_refresh', 'true');
-        }
-
-        const res = await fetch(
-          `http://localhost:8000/api/interesting-stocks?${params.toString()}`
-        );
-        const data = await res.json();
-        setStocks(data.stocks || []);
-        setCacheInfo({
-          cached: Boolean(data.cached),
-          age: data.cache_age_sec || 0,
-        });
-      } catch (err) {
-        console.error('Failed to fetch scanner data:', err);
+        applyMarketData(await requestMarketData(forceRefresh));
+      } catch (requestError) {
+        console.error('Failed to fetch scanner data:', requestError);
+        setError('Market data is unavailable. Check that the scanner API is running, then try again.');
       } finally {
         setLoading(false);
       }
     },
-    [customTickers]
+    [applyMarketData, requestMarketData]
   );
 
   useEffect(() => {
-    fetchMarketData(false);
-  }, [fetchMarketData]);
+    let active = true;
+    requestMarketData()
+      .then((data) => {
+        if (active) applyMarketData(data);
+      })
+      .catch((requestError) => {
+        if (!active) return;
+        console.error('Failed to fetch scanner data:', requestError);
+        setError('Market data is unavailable. Check that the scanner API is running, then try again.');
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [applyMarketData, requestMarketData]);
 
-  const handleAddTicker = (e) => {
-    e.preventDefault();
-    const cleaned = tickerInput.toUpperCase().replace(/[^A-Z]/g, '');
-    if (cleaned && cleaned.length <= 5 && !customTickers.includes(cleaned)) {
-      setCustomTickers((prev) => [...prev, cleaned]);
+  const handleAddTicker = (event) => {
+    event.preventDefault();
+    const symbol = tickerInput.toUpperCase().replace(/[^A-Z]/g, '');
+    if (symbol && symbol.length <= 5 && !customTickers.includes(symbol)) {
+      setLoading(true);
+      setCustomTickers((current) => [...current, symbol]);
     }
     setTickerInput('');
   };
 
-  const handleRemoveTicker = (symbolToRemove) => {
-    setCustomTickers((prev) => prev.filter((sym) => sym !== symbolToRemove));
-  };
+  const filteredStocks = stocks.filter((stock) => {
+    if (filter === 'ALL') return true;
+    if (filter === 'PINNED') return stock.is_custom;
+    if (filter === 'OVERSOLD') {
+      return ['OVERSOLD', 'RELATIVE_OVERSOLD', 'SECTOR_WEAKNESS'].includes(stock.driver_type);
+    }
+    return stock.driver_type === filter;
+  });
 
-  const filteredStocks =
-    filter === 'ALL'
-      ? stocks
-      : filter === 'PINNED'
-      ? stocks.filter((s) => s.is_custom)
-      : stocks.filter((s) => s.driver_type === filter);
+  const comparableStocks = stocks.filter((stock) => stock.excess_return_20d != null);
+  const outperformers = comparableStocks.filter((stock) => stock.excess_return_20d > 0).length;
+  const averageExcessReturn = comparableStocks.length
+    ? comparableStocks.reduce((total, stock) => total + stock.excess_return_20d, 0) /
+      comparableStocks.length
+    : null;
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 p-6 font-sans">
-      <div className="max-w-6xl mx-auto">
-        {/* Top Header */}
-        <header className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-slate-800 pb-6 mb-6">
-          <div>
-            <div className="flex items-center gap-3">
-              <h1 className="text-2xl font-bold tracking-tight">
-                Market Anomaly & Sentiment Radar
-              </h1>
-              <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-400">
-                {cacheInfo.cached ? `Cached (${cacheInfo.age}s ago)` : 'Live Scan'}
-              </span>
-            </div>
-            <p className="text-sm text-slate-400 mt-1">
-              Auto-discovering active movers + custom watchlist ranked by RVOL, RSI-14, and News Polarity
-            </p>
+    <main className="app-shell">
+      <div className="dashboard">
+        <header className="topbar">
+          <a className="brand" href="/" aria-label="Market pulse home">
+            <span className="brand-mark" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </span>
+            <span>MARKET<span className="brand-light">PULSE</span></span>
+          </a>
+          <div className="market-status">
+            <span className={`status-dot ${loading ? 'is-loading' : ''}`} />
+            <span>{loading ? 'Updating market' : cacheInfo.cached ? `Updated ${cacheInfo.age}s ago` : 'Market scan live'}</span>
           </div>
-
-          {/* Custom Ticker Injection Form */}
-          <form onSubmit={handleAddTicker} className="flex items-center gap-2">
-            <input
-              type="text"
-              value={tickerInput}
-              onChange={(e) => setTickerInput(e.target.value)}
-              placeholder="Inject ticker (e.g. PLTR)"
-              maxLength={5}
-              className="bg-slate-900 border border-slate-700 rounded-md px-3 py-1.5 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500 uppercase font-mono w-48"
-            />
-            <button
-              type="submit"
-              className="px-3 py-1.5 rounded-md text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white transition"
-            >
-              + Track
-            </button>
-            <button
-              type="button"
-              onClick={() => fetchMarketData(true)}
-              title="Bypass 60s cache and fetch fresh prices"
-              className="px-3 py-1.5 rounded-md text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition"
-            >
-              ↻ Force Live
-            </button>
-          </form>
         </header>
 
-        {/* Active Custom Ticker Pills */}
+        <section className="intro">
+          <div className="intro-copy">
+            <p className="eyebrow">MARKET OVERVIEW <span>·</span> DAILY SIGNALS</p>
+            <h1>Find the move<br /><span>behind the market.</span></h1>
+            <p className="intro-description">
+              Momentum, relative strength and market catalysts in one focused view.
+            </p>
+          </div>
+          <form className="controls" onSubmit={handleAddTicker}>
+            <label className="ticker-entry">
+              <span className="sr-only">Add a ticker to your watchlist</span>
+              <span className="search-icon" aria-hidden="true">⌕</span>
+              <input
+                type="text"
+                value={tickerInput}
+                onChange={(event) => setTickerInput(event.target.value)}
+                placeholder="Add ticker"
+                maxLength={5}
+                aria-label="Add ticker"
+              />
+              <button type="submit" className="add-button" disabled={!tickerInput.trim()}>
+                Add
+              </button>
+            </label>
+            <button
+              type="button"
+              className="refresh-button"
+              onClick={() => fetchMarketData(true)}
+              disabled={loading}
+              title="Bypass the cache and fetch fresh market data"
+            >
+              <span aria-hidden="true">↻</span> Refresh
+            </button>
+          </form>
+        </section>
+
         {customTickers.length > 0 && (
-          <div className="flex flex-wrap items-center gap-2 mb-5 bg-slate-900/50 p-3 rounded-lg border border-slate-800">
-            <span className="text-xs text-slate-400 font-medium mr-1">Pinned Tickers:</span>
-            {customTickers.map((sym) => (
-              <span
-                key={sym}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-mono font-semibold bg-indigo-950/60 text-indigo-300 border border-indigo-500/40"
-              >
-                {sym}
+          <div className="watchlist-strip">
+            <span className="watchlist-label">YOUR WATCHLIST</span>
+            {customTickers.map((symbol) => (
+              <span className="watchlist-chip" key={symbol}>
+                {symbol}
                 <button
-                  onClick={() => handleRemoveTicker(sym)}
-                  className="text-indigo-400 hover:text-white leading-none"
-                  aria-label={`Remove ${sym}`}
+                  type="button"
+                  onClick={() => {
+                    setLoading(true);
+                    setCustomTickers((current) => current.filter((item) => item !== symbol));
+                  }}
+                  aria-label={`Remove ${symbol} from watchlist`}
                 >
                   ×
                 </button>
@@ -170,166 +204,155 @@ export default function App() {
           </div>
         )}
 
-        {/* Catalyst Filter Tabs */}
-        <div className="flex flex-wrap items-center gap-2 mb-6">
-          {['ALL', 'PINNED', 'VOLUME_SURGE', 'OVERSOLD', 'OVERBOUGHT', 'NEWS_CATALYST'].map(
-            (type) => (
-              <button
-                key={type}
-                onClick={() => setFilter(type)}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium transition ${
-                  filter === type
-                    ? 'bg-indigo-600 text-white'
-                    : 'bg-slate-900 text-slate-400 hover:bg-slate-800'
-                }`}
-              >
-                {type.replace('_', ' ')}
-              </button>
-            )
-          )}
-        </div>
+        <section className="overview-grid" aria-label="Market overview">
+          <article className="overview-card">
+            <span className="overview-label">SCANNED</span>
+            <div className="overview-value">{stocks.length || '—'}<span> symbols</span></div>
+            <span className="overview-note">Active movers & watchlist</span>
+          </article>
+          <article className="overview-card overview-highlight">
+            <span className="overview-label">BEATING BENCHMARK</span>
+            <div className="overview-value">
+              {comparableStocks.length ? `${outperformers}/${comparableStocks.length}` : '—'}
+              <span> stocks</span>
+            </div>
+            <span className="overview-note">Positive 20-day excess return</span>
+          </article>
+          <article className="overview-card">
+            <span className="overview-label">AVG. EXCESS RETURN</span>
+            <div className={`overview-value ${averageExcessReturn > 0 ? 'positive' : averageExcessReturn < 0 ? 'negative' : ''}`}>
+              {formatPercent(averageExcessReturn)}
+            </div>
+            <span className="overview-note">Versus each stock's benchmark · 20D</span>
+          </article>
+        </section>
 
-        {/* Loading State */}
-        {loading ? (
-          <div className="text-center py-20 text-slate-400 animate-pulse">
-            Scanning live market movers and calculating technical anomalies...
-          </div>
-        ) : filteredStocks.length === 0 ? (
-          <div className="text-center py-16 text-slate-500 border border-dashed border-slate-800 rounded-xl">
-            No stocks currently match the "{filter.replace('_', ' ')}" filter.
-          </div>
-        ) : (
-          /* Dynamic Grid */
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-            {filteredStocks.map((stock) => {
-              const style = DRIVER_STYLES[stock.driver_type] || DRIVER_STYLES.BALANCED;
-              const isPositive = stock.pct_change >= 0;
-
-              return (
-                <div
-                  key={stock.symbol}
-                  className={`rounded-xl border p-5 transition-all shadow-lg ${style.border}`}
+        <section className="signals-section">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">LIVE SCANNER</p>
+              <h2>Market signals <span className="result-count">{filteredStocks.length}</span></h2>
+            </div>
+            <div className="filter-list" role="group" aria-label="Filter market signals">
+              {FILTERS.map(([value, label]) => (
+                <button
+                  type="button"
+                  key={value}
+                  className={`filter-button ${filter === value ? 'active' : ''}`}
+                  onClick={() => setFilter(value)}
+                  aria-pressed={filter === value}
                 >
-                  {/* Top Row: Ticker & Score */}
-                  <div className="flex justify-between items-start mb-3">
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-xl font-bold">{stock.symbol}</span>
-                        <span
-                          className={`text-xs font-semibold px-2 py-0.5 rounded ${
-                            isPositive
-                              ? 'bg-emerald-500/20 text-emerald-400'
-                              : 'bg-rose-500/20 text-rose-400'
-                          }`}
-                        >
-                          {isPositive ? '+' : ''}
-                          {stock.pct_change}%
-                        </span>
-                        {stock.is_custom && (
-                          <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/40">
-                            PINNED
-                          </span>
-                        )}
-                      </div>
-                      <div className="text-lg font-mono text-slate-200 mt-0.5">
-                        ${stock.price.toFixed(2)}
-                      </div>
-                    </div>
-
-                    <div className="text-right">
-                      <span className="text-[10px] uppercase tracking-wider text-slate-400 block">
-                        Anomaly Score
-                      </span>
-                      <span className={`text-xl font-black ${style.accent}`}>
-                        {stock.interesting_score}
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Dynamic Catalyst Badge */}
-                  <div
-                    className={`inline-block text-xs px-2.5 py-1 rounded-md border mb-4 ${style.badge}`}
-                  >
-                    {stock.driver_label}
-                  </div>
-
-                  {/* Conditional Display 1: Volume Surge Bar */}
-                  {stock.driver_type === 'VOLUME_SURGE' && (
-                    <div className="mb-4 bg-slate-900/80 p-3 rounded-lg border border-amber-500/20">
-                      <div className="flex justify-between text-xs mb-1">
-                        <span className="text-amber-300">Relative Volume Surge</span>
-                        <span className="font-mono font-bold">{stock.rvol}x avg</span>
-                      </div>
-                      <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
-                        <div
-                          className="bg-amber-400 h-full"
-                          style={{ width: `${Math.min(100, (stock.rvol / 3) * 100)}%` }}
-                        />
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Conditional Display 2: RSI Meter */}
-                  {(stock.driver_type === 'OVERSOLD' || stock.driver_type === 'OVERBOUGHT') && (
-                    <div className="mb-4 bg-slate-900/80 p-3 rounded-lg border border-slate-700">
-                      <div className="flex justify-between text-xs mb-1">
-                        <span className="text-slate-300">14-Day RSI Extreme</span>
-                        <span className="font-mono font-bold">{stock.rsi} / 100</span>
-                      </div>
-                      <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
-                        <div
-                          className={`h-full ${
-                            stock.rsi >= 70 ? 'bg-rose-500' : 'bg-emerald-500'
-                          }`}
-                          style={{ width: `${stock.rsi}%` }}
-                        />
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Conditional Display 3: Highlighted News Box */}
-                  {stock.top_headline && (
-                    <div
-                      className={`p-3 rounded-lg text-xs leading-relaxed ${
-                        stock.driver_type === 'NEWS_CATALYST'
-                          ? 'bg-sky-950/60 border border-sky-500/30 text-sky-100'
-                          : 'bg-slate-900/50 text-slate-400'
-                      }`}
-                    >
-                      <span className="font-semibold uppercase text-[10px] tracking-wider block mb-1 opacity-75">
-                        Latest Catalyst (
-                        {stock.sentiment > 0
-                          ? 'Bullish'
-                          : stock.sentiment < 0
-                          ? 'Bearish'
-                          : 'Neutral'}
-                        )
-                      </span>
-                      "{stock.top_headline}"
-                    </div>
-                  )}
-
-                  {/* Footer Metrics */}
-                  <div className="grid grid-cols-3 gap-2 mt-4 pt-3 border-t border-slate-800/80 text-center text-xs">
-                    <div>
-                      <span className="text-slate-500 block">RVOL</span>
-                      <span className="font-mono">{stock.rvol}x</span>
-                    </div>
-                    <div>
-                      <span className="text-slate-500 block">RSI-14</span>
-                      <span className="font-mono">{stock.rsi}</span>
-                    </div>
-                    <div>
-                      <span className="text-slate-500 block">Sentiment</span>
-                      <span className="font-mono">{stock.sentiment}</span>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
+                  {label}
+                </button>
+              ))}
+            </div>
           </div>
-        )}
+
+          {error ? (
+            <div className="empty-state error-state">
+              <span className="empty-icon" aria-hidden="true">!</span>
+              <h3>Couldn’t load the market scan</h3>
+              <p>{error}</p>
+              <button className="retry-button" type="button" onClick={() => fetchMarketData(true)}>Try again</button>
+            </div>
+          ) : loading && stocks.length === 0 ? (
+            <div className="loading-grid" aria-label="Loading market scan">
+              {Array.from({ length: 6 }, (_, index) => <div className="skeleton-card" key={index} />)}
+            </div>
+          ) : filteredStocks.length === 0 ? (
+            <div className="empty-state">
+              <span className="empty-icon" aria-hidden="true">⌁</span>
+              <h3>{stocks.length ? 'No matching signals' : 'No market data yet'}</h3>
+              <p>{stocks.length ? 'Try another filter to see more of the scan.' : 'The scanner will show its latest signals here.'}</p>
+            </div>
+          ) : (
+            <div className="stock-grid">
+              {filteredStocks.map((stock) => {
+                const tone = DRIVER_STYLES[stock.driver_type] || 'slate';
+                const relativeRsi = stock.relative_rsi;
+                const relativeRsiPosition = relativeRsi == null ? 0 : Math.min(100, Math.max(0, relativeRsi));
+                const isPositive = stock.pct_change >= 0;
+
+                return (
+                  <article className={`stock-card tone-${tone}`} key={stock.symbol}>
+                    <div className="card-topline">
+                      <span className="signal-tag">{stock.driver_label}</span>
+                      <span className="score">SIGNAL <b>{formatNumber(stock.interesting_score, 0)}</b></span>
+                    </div>
+                    <div className="stock-heading">
+                      <div>
+                        <div className="symbol-line">
+                          <h3>{stock.symbol}</h3>
+                          {stock.is_custom && <span className="pinned-tag">PINNED</span>}
+                        </div>
+                        <p className="stock-price">${formatNumber(stock.price, 2)}</p>
+                      </div>
+                      <span className={`daily-change ${isPositive ? 'positive' : 'negative'}`}>
+                        {formatPercent(stock.pct_change)}
+                        <small>1D</small>
+                      </span>
+                    </div>
+
+                    <div className="relative-panel">
+                      <div className="relative-heading">
+                        <div>
+                          <span className="metric-label">RELATIVE RSI <span className="benchmark-name">vs {stock.benchmark || 'SPY'}</span></span>
+                          <strong>{formatNumber(relativeRsi)}<span className="out-of"> / 100</span></strong>
+                        </div>
+                        <span className={`relative-state ${relativeRsi == null ? '' : relativeRsi >= 60 ? 'positive' : relativeRsi <= 40 ? 'negative' : ''}`}>
+                          {relativeRsi == null ? 'N/A' : relativeRsi >= 60 ? 'Strong' : relativeRsi <= 40 ? 'Weak' : 'Neutral'}
+                        </span>
+                      </div>
+                      <div className="rsi-track" role="img" aria-label={`Relative RSI ${formatNumber(relativeRsi)} out of 100`}>
+                        <span className="rsi-zone weak-zone" />
+                        <span className="rsi-zone strong-zone" />
+                        {relativeRsi != null && <span className="rsi-marker" style={{ left: `${relativeRsiPosition}%` }} />}
+                      </div>
+                      <div className="scale-labels"><span>WEAK</span><span>NEUTRAL</span><span>STRONG</span></div>
+                    </div>
+
+                    <div className="benchmark-grid">
+                      <div>
+                        <span className="metric-label">BENCHMARK</span>
+                        <strong>{stock.benchmark || 'SPY'}</strong>
+                      </div>
+                      <div>
+                        <span className="metric-label">BENCHMARK 20D</span>
+                        <strong>{formatPercent(stock.benchmark_return_20d)}</strong>
+                      </div>
+                      <div>
+                        <span className="metric-label">EXCESS 20D</span>
+                        <strong className={stock.excess_return_20d > 0 ? 'positive' : stock.excess_return_20d < 0 ? 'negative' : ''}>
+                          {formatPercent(stock.excess_return_20d)}
+                        </strong>
+                      </div>
+                    </div>
+
+                    {stock.top_headline && (
+                      <div className="headline">
+                        <span className="headline-label">LATEST CATALYST</span>
+                        <p>{stock.top_headline}</p>
+                      </div>
+                    )}
+
+                    <div className="card-footer">
+                      <span>RSI-14 <b>{formatNumber(stock.rsi)}</b></span>
+                      <span>RVOL <b>{formatNumber(stock.rvol, 2)}x</b></span>
+                      <span>SENTIMENT <b>{formatNumber(stock.sentiment, 2)}</b></span>
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+          )}
+        </section>
+        <footer className="page-footer">
+          <span>Market data for informational purposes only.</span>
+          <span>{loading && stocks.length > 0 ? 'Updating scan…' : `${stocks.length} symbols in current scan`}</span>
+        </footer>
       </div>
-    </div>
+    </main>
   );
 }
+
+export default App;
